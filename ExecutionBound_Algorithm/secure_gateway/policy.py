@@ -373,6 +373,9 @@ class Issuer:
             raise PolicyError("unknown_provenance_kind")
         if not isinstance(fields, Mapping) or not fields:
             raise PolicyError("provenance_requires_exact_field_values")
+        fields = {k: _xyz(v) if k == "target_xyz" else
+                  _number(v, k) if k in ("speed_m_s", "depth_m", "volume_m3") else v
+                  for k, v in fields.items()}
         label = Provenance(source_id, kind, canonical_json(fields), mission_id,
                            _number(observed_at, "observed_at", 0))
         return replace(label, signature=self._sign("provenance-v1", label.body()))
@@ -409,8 +412,8 @@ def _tube(value: Any) -> dict[str, Any] | None:
     if len(radius) != len(nominal):
         raise PolicyError("invalid_state_tube_radius")
     out = {"field": field_name, "nominal": nominal, "radius": radius}
-    if value.get("execution_radius") is not None:
-        out["execution_radius"] = _number(value["execution_radius"], "execution_radius", 0)
+    out["execution_radius"] = (_number(value["execution_radius"], "execution_radius", 0)
+                               if value.get("execution_radius") is not None else min(radius))
     return out
 
 
@@ -536,6 +539,7 @@ class Gateway:
         # Execution authority records for dispatched skills (lease_id -> record).
         self._active: dict[str, dict[str, Any]] = {}
         self._last_tube: dict[str, Any] | None = None
+        self._versions = {contract.mission_id: contract.version}
 
     @property
     def full(self):
@@ -561,8 +565,9 @@ class Gateway:
     def update_contract(self, contract: MissionContract):
         """Trusted operation. New authority resets explicit per-contract budgets."""
         with self._lock:
-            if contract.mission_id == self.contract.mission_id and contract.version <= self.contract.version:
+            if contract.version <= self._versions.get(contract.mission_id, 0):
                 raise PolicyError("contract_version_must_increase")
+            self._versions[contract.mission_id] = contract.version
             self.contract = contract
             self.sequence = self.action_count = 0
             self.total_volume_m3 = 0.0
@@ -719,6 +724,11 @@ class Gateway:
                 if reason:
                     return self._result(False, reason, a, "validate", now)
                 tube = self._last_tube if self.uses_tube else None
+                if tube is not None:
+                    d0 = _tube_distance(tube, state)
+                    if d0 is None or d0 > 1.0 + 1e-12:
+                        return self._result(False, "validated_state_outside_certified_tube",
+                                            a, "validate", now)
                 lease = Lease(secrets.token_hex(16), a.request_id, action_hash,
                               trajectory_hash, state_hash, self.contract.contract_hash,
                               capability, now, now + self.contract.lease_ttl_s,
@@ -860,13 +870,20 @@ class Gateway:
         stop. The planner has no interface to this method.
         """
         with self._lock, self.issuer._lock:
-            now = _number(now, "now", 0)
             lid = lease.lease_id if isinstance(lease, Lease) else None
             record = self._active.get(lid)
             if record is None:
                 return Decision(False, "no_active_execution", lease, "inactive")
             reason = None
-            if (self.mode != Mode.B4_NO_REVOCATION and record["capability_id"] is not None
+            try:
+                now = _number(now, "now", 0)
+                if tracking_error is not None:
+                    tracking_error = _number(tracking_error, "tracking_error", 0)
+            except PolicyError:
+                now, reason = _audit_time(now), "invalid_supervision_input"
+            if reason is not None:
+                pass
+            elif (self.mode != Mode.B4_NO_REVOCATION and record["capability_id"] is not None
                     and self.issuer.is_revoked(record["capability_id"])):
                 reason = "capability_revoked_during_execution"
             elif record["contract_hash"] != self.contract.contract_hash:
@@ -874,7 +891,7 @@ class Gateway:
             elif record["capability_expires_at"] is not None and now >= record["capability_expires_at"]:
                 reason = "capability_expired_during_execution"
             elif (tracking_error is not None and record["execution_radius"] is not None
-                  and _number(tracking_error, "tracking_error", 0) > record["execution_radius"]):
+                  and tracking_error > record["execution_radius"]):
                 reason = "execution_left_certified_tube"
             if reason is None:
                 return Decision(True, "authority_current", lease, "executing")

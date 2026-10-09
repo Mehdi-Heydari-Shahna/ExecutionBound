@@ -79,6 +79,9 @@ class ModelGateway(Gateway):
         live_state: Any,
     ) -> Decision:
         """Commit through the designated executor with an explicit live state."""
+        if live_state is None:
+            return self._result(False, "missing_live_state",
+                                action if isinstance(action, Action) else None, "commit", now)
         return self.commit(lease, action, trajectory, state, now, self.sink,
                            live_state=live_state)
 
